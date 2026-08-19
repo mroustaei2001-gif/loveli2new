@@ -1,4 +1,5 @@
 import os, re, random, asyncio, logging, sqlite3
+from zoneinfo import ZoneInfo
 from datetime import datetime, timedelta
 from html import escape as html_escape
 import aiosqlite
@@ -48,7 +49,7 @@ class DB:
                 cols = [row[1] for row in await cur.fetchall()]
             if 'is_spoiler' not in cols:
                 await conn.execute("ALTER TABLE batch_posts ADD COLUMN is_spoiler INTEGER DEFAULT 0")
-            for k, v in [('min_interval','60'),('max_interval','120'),('batch_size','5'),('main_channel','-1004461131517'),('footer',''),('format','bold'),('emoji','1'),('emoji_tag',''),('cap_emoji','0'),('cap_emoji_tag',''),('id_emoji_tag',''), ('cap_emoji_count', '5')]:
+            for k, v in [('min_interval','60'),('max_interval','120'),('batch_size','5'),('main_channel','-1004461131517'),('footer',''),('format','bold'),('emoji','1'),('emoji_tag',''),('cap_emoji','0'),('cap_emoji_tag',''),('id_emoji_tag',''), ('cap_emoji_count', '5'), ('pre_fixed', ''), ('pre_count', '3'), ('sp_pre', '❤️🩵🩷')]:
                 await conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
             await conn.commit()
     async def get(self, key):
@@ -78,6 +79,9 @@ class States(StatesGroup):
     set_id_emoji = State()
     set_cap_emoji_count = State()
     set_sp_id_emoji = State()
+    set_pre_fixed = State()
+    set_pre_count = State()
+    set_sp_pre = State()
 
 def clean_text(text):
     if not text: return ''
@@ -215,6 +219,8 @@ def settings_kb():
         [InlineKeyboardButton(text="⭐ ایموجی اول", callback_data="set_emoji_tag"), InlineKeyboardButton(text="⭐ روشن/خاموش", callback_data="toggle_emoji")],
         [InlineKeyboardButton(text="✨ ایموجی کپشن", callback_data="set_cap_emoji"), InlineKeyboardButton(text="✨ روشن/خاموش", callback_data="toggle_cap_emoji")],
         [InlineKeyboardButton(text="🔢 تعداد ایموجی کپشن", callback_data="set_cap_emoji_count")],
+        [InlineKeyboardButton(text="🎯 ایموجی ثابت اول کپشن", callback_data="set_pre_fixed")],
+        [InlineKeyboardButton(text="🔢 تعداد ایموجی اول کپشن", callback_data="set_pre_count"), InlineKeyboardButton(text="⚠️ قلب اول کپشن اسپویلر", callback_data="set_sp_pre")],
         [InlineKeyboardButton(text="🆔 ایموجی ایدی", callback_data="set_id_emoji")],
         [InlineKeyboardButton(text="⚠️ ایموجی ایدی اسپویلر", callback_data="set_sp_id_emoji")],
         [InlineKeyboardButton(text="🔙 بازگشت به منو", callback_data="menu")],
@@ -352,7 +358,9 @@ async def show_cap_view(chat_id):
         [InlineKeyboardButton(text="✏️ ویرایش", callback_data="edit_cap_emoji"), InlineKeyboardButton(text="🗑 حذف", callback_data="del_cap_emoji")],
         [InlineKeyboardButton(text="🔙 بازگشت", callback_data="settings")],
     ])
-    await bot.send_message(chat_id, f"ایموجی‌های کپشن فعلی:\n{tag or '(خالی)'}", reply_markup=kb)
+    cnt = len([t for t in tag.split('|||||') if t.strip()])
+    disp = tag if len(tag) <= 800 else tag[:800] + '…'
+    await bot.send_message(chat_id, f"🔢 تعداد استخر: {cnt}\nایموجی‌های فعلی:\n{disp or '(خالی)'}", reply_markup=kb)
 
 @router.callback_query(F.data == "set_cap_emoji")
 async def cb_set_cap_emoji(callback: types.CallbackQuery):
@@ -761,11 +769,17 @@ async def do_publish(pid):
         body_full = format_text(text or '', fmt)
         cap_footer = ''
         if (await db.get('cap_emoji')) == '1' and not is_spoiler:
-            pool = list(dict.fromkeys(t.strip() for t in ((await db.get('cap_emoji_tag')) or '').split('|||||') if t.strip()))
+            pool = list(dict.fromkeys(t.strip() for t in ((await db.get('cap_emoji_tag')) or '').split('|||||') if t.strip()))[:200]
             if pool:
                 cap_footer = NL + ''.join(random.sample(pool, min(int(await db.get('cap_emoji_count') or 5), len(pool), 10)))
         tag = (await db.get('emoji_tag')) or ''
-        pre = (tag + " ") if (emoji and tag) else ""
+        if is_spoiler:
+            pre = ((await db.get('sp_pre')) or '❤️🩵🩷') + ' '
+        else:
+            fixed = (await db.get('pre_fixed')) or (tag if emoji else '')
+            pool0 = list(dict.fromkeys(t.strip() for t in ((await db.get('cap_emoji_tag')) or '').split('|||||') if t.strip()))[:200]
+            rand0 = ''.join(random.sample(pool0, min(int(await db.get('pre_count') or 3), len(pool0), 10))) if pool0 else ''
+            pre = (fixed + rand0 + " ") if (fixed or rand0) else ""
         ch_name = str(channel)
         try:
             chat = await bot.get_chat(channel)
@@ -899,12 +913,20 @@ async def cb_sched_all(callback: types.CallbackQuery, state: FSMContext):
 async def msg_set_time_all(message: types.Message, state: FSMContext):
     try:
         parts = message.text.split()
-        h, mi = map(int, parts[0].split(':'))
-        day = parts[1] if len(parts) > 1 else 'today'
-        target = datetime.now().replace(hour=h, minute=mi, second=0, microsecond=0)
+        time_tok = None; day = 'today'
+        for t in parts:
+            if ':' in t: time_tok = t
+            elif t in ('tomorrow', 'farda', 'فردا'): day = 'tomorrow'
+        if not time_tok: raise ValueError('time missing')
+        h, mi = map(int, time_tok.split(':'))
+        now_ir = datetime.now(ZoneInfo('Asia/Tehran')).replace(tzinfo=None)
+        target = now_ir.replace(hour=h, minute=mi, second=0, microsecond=0)
         if day == 'tomorrow': target += timedelta(days=1)
-        elif target <= datetime.now(): target += timedelta(days=1)
-        channel = int(await db.get('main_channel'))
+        elif target <= now_ir: target += timedelta(days=1)
+        ch = (await db.get('main_channel')).strip()
+        try: channel = int(ch)
+        except ValueError:
+            chat = await bot.get_chat(ch); channel = chat.id
         async with aiosqlite.connect('auto_pub.db') as conn:
             ids = [r[0] for r in await (await conn.execute("SELECT id FROM batch_posts WHERE status='approved'")).fetchall()]
             for pid in ids:
@@ -998,7 +1020,7 @@ async def scheduler():
     while True:
         try:
             async with aiosqlite.connect('auto_pub.db') as conn:
-                due = await (await conn.execute("SELECT id, post_id FROM schedules WHERE scheduled_at <= ?", (datetime.now().isoformat(),))).fetchall()
+                due = await (await conn.execute("SELECT id, post_id FROM schedules WHERE scheduled_at <= ?", (datetime.now(ZoneInfo('Asia/Tehran')).replace(tzinfo=None).isoformat(),))).fetchall()
                 for sid, pid in due:
                     await do_publish(pid)
                     await conn.execute("DELETE FROM schedules WHERE id=?", (sid,))
@@ -1025,7 +1047,7 @@ async def main():
         except Exception as e:
             logger.error(f"premium start: {e}")
     asyncio.create_task(scheduler())
-    asyncio.create_task(auto_batch())
+    # asyncio.create_task(auto_batch())
     await dp.start_polling(bot)
 
 
@@ -1077,6 +1099,57 @@ async def cb_set_sp_id_emoji(callback: types.CallbackQuery, state: FSMContext):
 async def msg_set_sp_id_emoji(message: types.Message, state: FSMContext):
     await db.set('sp_id_emoji', message.text.strip())
     await message.answer(f"✅ ذخیره شد: {message.text.strip()}", reply_markup=menu_kb())
+    await state.clear()
+
+
+@router.callback_query(F.data == "set_pre_fixed")
+async def cb_set_pre_fixed(callback: types.CallbackQuery, state: FSMContext):
+    await bot.send_message(callback.from_user.id, "ایموجی/استیکر ثابت اول کپشن را بفرست:")
+    await state.set_state(States.set_pre_fixed)
+    await callback.answer()
+
+@router.message(States.set_pre_fixed)
+async def msg_set_pre_fixed(message: types.Message, state: FSMContext):
+    txt = message.text or ''
+    tags = []
+    if message.entities:
+        for ent in message.entities:
+            if ent.type == 'custom_emoji':
+                sub = txt[ent.offset:ent.offset+ent.length]
+                tags.append(f'<tg-emoji emoji-id="{ent.custom_emoji_id}">{sub}</tg-emoji>')
+    val = ''.join(tags) if tags else txt.strip()
+    await db.set('pre_fixed', val)
+    await message.answer("✅ ایموجی ثابت اول کپشن ذخیره شد.", reply_markup=menu_kb())
+    await state.clear()
+
+
+@router.callback_query(F.data == "set_pre_count")
+async def cb_set_pre_count(callback: types.CallbackQuery, state: FSMContext):
+    await bot.send_message(callback.from_user.id, "تعداد ایموجی رندوم اول کپشن (مثلا 3):")
+    await state.set_state(States.set_pre_count)
+    await callback.answer()
+
+@router.message(States.set_pre_count)
+async def msg_set_pre_count(message: types.Message, state: FSMContext):
+    try:
+        n = int(message.text)
+        if n < 0: n = 0
+        await db.set('pre_count', n)
+        await message.answer(f"✅ ذخیره شد: {n} ایموجی رندوم اول کپشن.", reply_markup=menu_kb())
+    except Exception:
+        await message.answer("❌ عدد نامعتبر.")
+    await state.clear()
+
+@router.callback_query(F.data == "set_sp_pre")
+async def cb_set_sp_pre(callback: types.CallbackQuery, state: FSMContext):
+    await bot.send_message(callback.from_user.id, "قلب/ایموجی اول کپشن پست‌های اسپویلردار را بفرست (مثل ❤️🩵🩷):")
+    await state.set_state(States.set_sp_pre)
+    await callback.answer()
+
+@router.message(States.set_sp_pre)
+async def msg_set_sp_pre(message: types.Message, state: FSMContext):
+    await db.set('sp_pre', (message.text or '').strip())
+    await message.answer("✅ قلب اول کپشن اسپویلر ذخیره شد.", reply_markup=menu_kb())
     await state.clear()
 
 if __name__ == "__main__":
