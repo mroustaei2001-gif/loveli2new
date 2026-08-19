@@ -5,13 +5,13 @@ from html import escape as html_escape
 import aiosqlite
 from aiogram import Bot, Dispatcher, Router, types, F
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
+from aiogram.types import InputMediaPhoto, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from aiogram.enums import ParseMode
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from telethon import TelegramClient
-from telethon.tl.types import MessageMediaPhoto
+from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -49,7 +49,7 @@ class DB:
                 cols = [row[1] for row in await cur.fetchall()]
             if 'is_spoiler' not in cols:
                 await conn.execute("ALTER TABLE batch_posts ADD COLUMN is_spoiler INTEGER DEFAULT 0")
-            for k, v in [('min_interval','60'),('max_interval','120'),('batch_size','5'),('main_channel','-1004461131517'),('footer',''),('format','bold'),('emoji','1'),('emoji_tag',''),('cap_emoji','0'),('cap_emoji_tag',''),('id_emoji_tag',''), ('cap_emoji_count', '5'), ('pre_fixed', ''), ('pre_count', '3'), ('sp_pre', '❤️🩵🩷')]:
+            for k, v in [('min_interval','60'),('max_interval','120'),('batch_size','5'),('main_channel','-1004461131517'),('footer',''),('format','bold'),('emoji','1'),('emoji_tag',''),('cap_emoji','0'),('cap_emoji_tag',''),('id_emoji_tag',''), ('cap_emoji_count', '5'), ('pre_fixed', ''), ('pre_count', '3'), ('sp_pre', '❤️🩵🩷'), ('rand_footer', '')]:
                 await conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
             await conn.commit()
     async def get(self, key):
@@ -82,6 +82,7 @@ class States(StatesGroup):
     set_pre_fixed = State()
     set_pre_count = State()
     set_sp_pre = State()
+    set_rand_footer = State()
 
 def clean_text(text):
     if not text: return ''
@@ -221,6 +222,7 @@ def settings_kb():
         [InlineKeyboardButton(text="🔢 تعداد ایموجی کپشن", callback_data="set_cap_emoji_count")],
         [InlineKeyboardButton(text="🎯 ایموجی ثابت اول کپشن", callback_data="set_pre_fixed")],
         [InlineKeyboardButton(text="🔢 تعداد ایموجی اول کپشن", callback_data="set_pre_count"), InlineKeyboardButton(text="⚠️ قلب اول کپشن اسپویلر", callback_data="set_sp_pre")],
+        [InlineKeyboardButton(text="🎲 فوتر رندوم", callback_data="set_rand_footer")],
         [InlineKeyboardButton(text="🆔 ایموجی ایدی", callback_data="set_id_emoji")],
         [InlineKeyboardButton(text="⚠️ ایموجی ایدی اسپویلر", callback_data="set_sp_id_emoji")],
         [InlineKeyboardButton(text="🔙 بازگشت به منو", callback_data="menu")],
@@ -458,15 +460,62 @@ async def msg_set_emoji_tag(message: types.Message, state: FSMContext):
     await message.answer(f"✅ ذخیره شد:\n{tag}", reply_markup=menu_kb())
     await state.clear()
 
+async def resolve_source(name):
+    try:
+        return await telethon_client.get_entity(name)
+    except Exception:
+        from telethon import functions
+        try:
+            r = await telethon_client(functions.messages.ImportChatInvite(hash=name.lstrip('+').strip()))
+            if r.chats: return r.chats[0]
+        except Exception:
+            pass
+        try:
+            return await telethon_client.get_entity(int(name))
+        except Exception:
+            return None
+
+async def get_album_paths(source, msg_id):
+    try:
+        if not telethon_client.is_connected(): await telethon_client.connect()
+        entity = await telethon_client.get_entity(source)
+        msg = await telethon_client.get_messages(entity, ids=msg_id)
+        if not msg or not msg.grouped_id:
+            p = await get_media_path(source, msg_id); return [p] if p else []
+        ids = []
+        async for m in telethon_client.iter_messages(entity, min_id=msg_id-10, max_id=msg_id+10):
+            if m.grouped_id == msg.grouped_id and m.media: ids.append(m.id)
+        ids.sort()
+        paths = []
+        for i in ids:
+            base = os.path.join(MEDIA_DIR, f"{source.strip('@')}_{i}")
+            found = None
+            for ext in ('.jpg', '.mp4'):
+                if os.path.exists(base+ext): found = base+ext; break
+            if not found:
+                mm = await telethon_client.get_messages(entity, ids=i)
+                ext = '.mp4' if (mm.file and mm.file.mime_type=='video/mp4') else '.jpg'
+                found = base+ext
+                await telethon_client.download_media(mm, found)
+            if found and os.path.exists(found): paths.append(found)
+        return paths or ([await get_media_path(source, msg_id)])
+    except Exception as e:
+        logger.error(f"album: {e}")
+        p = await get_media_path(source, msg_id); return [p] if p else []
+
 async def get_media_path(source, msg_id):
-    path = os.path.join(MEDIA_DIR, f"{source.strip('@')}_{msg_id}.jpg")
-    if os.path.exists(path): return path
+    base = os.path.join(MEDIA_DIR, f"{source.strip('@')}_{msg_id}")
+    for ext in ('.jpg', '.mp4'):
+        if os.path.exists(base+ext): return base+ext
+    path = base + '.jpg'
     if not telethon_client.is_connected():
         await telethon_client.connect()
     try:
         entity = await telethon_client.get_entity(source)
         msg = await telethon_client.get_messages(entity, ids=msg_id)
         if msg and msg.media:
+            ext = '.mp4' if (msg.file and msg.file.mime_type=='video/mp4') else '.jpg'
+            path = base+ext
             await telethon_client.download_media(msg, path)
             return path if os.path.exists(path) else None
     except Exception as e:
@@ -491,34 +540,44 @@ async def generate_batch(chat_id):
     if not sources:
         return await bot.send_message(chat_id, "⚠️ منبعی نیست.", reply_markup=menu_kb())
     pool = []
-    for sid, uname in sources:
+    srcs = list(sources)
+    random.shuffle(srcs)
+    for sid, uname in srcs:
         uname = uname.strip()
         if uname.startswith('http'): uname = uname.split('/')[-1]
         uname = uname.lstrip('@').strip('/').rstrip('.')
-        photos, textpost = [], None
+        got = []
         try:
-            entity = await telethon_client.get_entity(uname)
-            async for m in telethon_client.iter_messages(entity, limit=100):
+            entity = await resolve_source(uname)
+            if entity and str(uname).startswith('+'):
+                await conn.execute("UPDATE sources SET username=? WHERE id=?", (str(entity.id), sid))
+            async for m in telethon_client.iter_messages(entity, limit=500):
                 if not m: continue
                 if (uname, m.id) in used: continue
+                has_sp = bool(getattr(m, 'media_spoiler', False)) or any(getattr(e,'type','')=='spoiler' for e in (m.entities or []))
+                dt = m.date
                 if isinstance(m.media, MessageMediaPhoto) and clean_text(m.text):
-                    photos.append((uname, m.id, clean_text(m.text)))
-                    if len(photos) >= 2: break
-                elif not m.media and m.text and textpost is None:
-                    textpost = (uname, m.id, clean_text(m.text))
+                    got.append((uname, m.id, clean_text(m.text), 1 if has_sp else 0, 'photo', dt))
+                elif isinstance(m.media, MessageMediaDocument) and m.file and m.file.mime_type=='video/mp4' and clean_text(m.text):
+                    got.append((uname, m.id, clean_text(m.text), 1 if has_sp else 0, 'gif', dt))
+                elif not m.media and m.text and clean_text(m.text):
+                    got.append((uname, m.id, clean_text(m.text), 1 if has_sp else 0, 'text', dt))
+                if len(got) >= 2: break
         except Exception as e:
             logger.error(f"fetch {uname}: {e}")
-        pool.extend(photos if photos else ([textpost] if textpost else []))
+        pool.extend(got)
     if not pool:
         return await bot.send_message(chat_id, "⚠️ پستی پیدا نشد.", reply_markup=menu_kb())
-    size = int(await db.get('batch_size'))
-    chosen = random.sample(pool, min(size, len(pool)))
+    pool.sort(key=lambda x: x[5], reverse=True)
+    top = pool[:random.randint(10,15)]
+    chosen = [list(t)[:5] for t in random.sample(top, min(5, len(top)))]
+
     async with aiosqlite.connect('auto_pub.db') as conn:
         cur = await conn.execute("INSERT INTO batches (admin_id, created_at) VALUES (?, ?)", (chat_id, datetime.now().isoformat()))
         batch_id = cur.lastrowid
         ids = []
-        for uname, mid, txt in chosen:
-            cur2 = await conn.execute("INSERT INTO batch_posts (batch_id, source, msg_id, text, media) VALUES (?,?,?,?,1)", (batch_id, uname, mid, txt))
+        for uname, mid, txt, sp, kind in chosen:
+            cur2 = await conn.execute("INSERT INTO batch_posts (batch_id, source, msg_id, text, media, is_spoiler) VALUES (?,?,?,?,?,?)", (batch_id, uname, mid, txt, (0 if kind=="text" else 1), sp))
             ids.append(cur2.lastrowid)
         await conn.commit()
     await bot.send_message(chat_id, f"🎲 {len(ids)} پست برای بررسی:", reply_markup=menu_kb())
@@ -534,7 +593,10 @@ async def send_preview(chat_id, pid):
     if media:
         path = await get_media_path(source, mid)
         if path:
-            await bot.send_photo(chat_id, FSInputFile(path), caption=text or None, reply_markup=kb)
+            if path.endswith('.mp4'):
+                await bot.send_animation(chat_id, FSInputFile(path), caption=text or None, reply_markup=kb)
+            else:
+                await bot.send_photo(chat_id, FSInputFile(path), caption=text or None, reply_markup=kb)
             return
     await bot.send_message(chat_id, text or "(بدون متن)", reply_markup=kb)
 
@@ -759,6 +821,12 @@ async def do_publish(pid):
         is_spoiler = bool(is_spoiler)
         fmt = pfmt or await db.get('format')
         footer = pfoot if pfoot is not None else await db.get('footer')
+        rpool = [x.strip() for x in ((await db.get('rand_footer')) or '').split('|||||') if x.strip()]
+        if rpool:
+            footer = random.choice(rpool)
+        elif footer:
+            fpool = [x.strip() for x in re.split(r'\|\|\|\|\||\n', footer) if x.strip()]
+            if fpool: footer = random.choice(fpool)
         emoji = await db.get('emoji') == '1'
         ch = (await db.get('main_channel')).strip()
         try: channel = int(ch)
@@ -822,7 +890,10 @@ async def do_publish(pid):
         if is_spoiler and path:
             cap2 = strip_prem(caption)
             try:
-                await bot.send_photo(channel, FSInputFile(path), caption=cap2, parse_mode=ParseMode.HTML, has_spoiler=True)
+                if path.endswith('.mp4'):
+                    await bot.send_animation(channel, FSInputFile(path), caption=cap2, parse_mode=ParseMode.HTML, has_spoiler=True)
+                else:
+                    await bot.send_photo(channel, FSInputFile(path), caption=cap2, parse_mode=ParseMode.HTML, has_spoiler=True)
                 sent = True
                 sent_via = 'bot-photo'
             except Exception as e1:
@@ -878,7 +949,10 @@ async def do_publish(pid):
                 cap2 = strip_prem(caption)
                 try:
                     if path:
-                        await bot.send_photo(channel, FSInputFile(path), caption=cap2, parse_mode=ParseMode.HTML)
+                        if path.endswith('.mp4'):
+                            await bot.send_animation(channel, FSInputFile(path), caption=cap2, parse_mode=ParseMode.HTML)
+                        else:
+                            await bot.send_photo(channel, FSInputFile(path), caption=cap2, parse_mode=ParseMode.HTML)
                     else:
                         await bot.send_message(channel, cap2, parse_mode=ParseMode.HTML)
                     sent = True
@@ -1151,6 +1225,53 @@ async def msg_set_sp_pre(message: types.Message, state: FSMContext):
     await db.set('sp_pre', (message.text or '').strip())
     await message.answer("✅ قلب اول کپشن اسپویلر ذخیره شد.", reply_markup=menu_kb())
     await state.clear()
+
+
+async def show_rand_view(chat_id):
+    pool = (await db.get('rand_footer')) or ''
+    items = [x for x in pool.split('|||||') if x.strip()]
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ افزودن", callback_data="add_rand_footer"), InlineKeyboardButton(text="🗑 حذف همه", callback_data="del_rand_footer")],
+        [InlineKeyboardButton(text="⬅ بازگشت", callback_data="settings")],
+    ])
+    disp = chr(10).join(f"{i+1}. {re.sub('<[^>]+>','',x)}" for i,x in enumerate(items[:20]))
+    await bot.send_message(chat_id, f"🎲 فوترهای رندوم ({len(items)}):\n{disp or '(خالی)'}", reply_markup=kb)
+
+@router.callback_query(F.data == "set_rand_footer")
+async def cb_set_rand_footer(callback: types.CallbackQuery, state: FSMContext):
+    await show_rand_view(callback.from_user.id)
+    await callback.answer()
+
+@router.callback_query(F.data == "add_rand_footer")
+async def cb_add_rand_footer(callback: types.CallbackQuery, state: FSMContext):
+    await bot.send_message(callback.from_user.id, "متن/ایموجی جدید بفرست (هر خط = یک گزینه):")
+    await state.set_state(States.set_rand_footer)
+    await callback.answer()
+
+@router.callback_query(F.data == "del_rand_footer")
+async def cb_del_rand_footer(callback: types.CallbackQuery, state: FSMContext):
+    await db.set('rand_footer', '')
+    await show_rand_view(callback.from_user.id)
+    await callback.answer()
+
+@router.message(States.set_rand_footer)
+async def msg_set_rand_footer(message: types.Message, state: FSMContext):
+    txt = message.text or ''
+    _old = (await db.get('rand_footer')) or ''
+    items = [x for x in _old.split('|||||') if x.strip()]
+    for line in txt.split('\n'):
+        if not line.strip(): continue
+        out = line
+        if message.entities:
+            for ent in message.entities:
+                if ent.type == 'custom_emoji':
+                    sub = txt[ent.offset:ent.offset+ent.length]
+                    if sub in out:
+                        out = out.replace(sub, f'<tg-emoji emoji-id="{ent.custom_emoji_id}">{sub}</tg-emoji>', 1)
+        items.append(out.strip())
+    await db.set('rand_footer', '|||||'.join(items))
+    await state.clear()
+    await show_rand_view(message.chat.id)
 
 if __name__ == "__main__":
     asyncio.run(main())
