@@ -86,7 +86,7 @@ class States(StatesGroup):
 
 def clean_text(text):
     if not text: return ''
-    text = re.sub(r'https?://\S+|www\.\S+', '', text)
+    text = re.sub(r'https?://\S+|www\.\S+|t\.me/\S+', '', text)
     text = re.sub(r'@\w+', '', text)
     text = re.sub(r'#\w+', '', text)
     return re.sub(r'\s+', ' ', text).strip()
@@ -524,8 +524,17 @@ async def get_media_path(source, msg_id):
 
 @router.callback_query(F.data == "new_batch")
 async def cb_new_batch(callback: types.CallbackQuery):
-    await callback.answer("در حال ساخت دسته...")
-    await generate_batch(callback.from_user.id)
+    chat_id=callback.from_user.id
+    for (cid,mid) in list(PREVIEW_MSGS):
+        if cid==chat_id:
+            try: await bot.delete_message(chat_id, mid)
+            except Exception: pass
+            PREVIEW_MSGS.remove((cid,mid))
+    status=await bot.send_message(chat_id, "⏳ در حال ساخت دسته... صبر کن")
+    await callback.answer()
+    await generate_batch(chat_id)
+    try: await status.delete()
+    except Exception: pass
 
 async def generate_batch(chat_id):
     if not telethon_client.is_connected():
@@ -550,27 +559,38 @@ async def generate_batch(chat_id):
         try:
             entity = await resolve_source(uname)
             if entity and str(uname).startswith('+'):
-                await conn.execute("UPDATE sources SET username=? WHERE id=?", (str(entity.id), sid))
-            async for m in telethon_client.iter_messages(entity, limit=500):
+                await conn.execute("UPDATE sources SET username=? WHERE id=?", (str(utils.get_peer_id(entity)), sid))
+            async for m in telethon_client.iter_messages(entity, limit=30):
                 if not m: continue
                 if (uname, m.id) in used: continue
                 has_sp = bool(getattr(m, 'media_spoiler', False)) or any(getattr(e,'type','')=='spoiler' for e in (m.entities or []))
                 dt = m.date
-                if isinstance(m.media, MessageMediaPhoto) and clean_text(m.text):
+                if isinstance(m.media, MessageMediaPhoto):
                     got.append((uname, m.id, clean_text(m.text), 1 if has_sp else 0, 'photo', dt))
-                elif isinstance(m.media, MessageMediaDocument) and m.file and m.file.mime_type=='video/mp4' and clean_text(m.text):
+                elif isinstance(m.media, MessageMediaDocument) and m.file and m.file.mime_type=='video/mp4':
                     got.append((uname, m.id, clean_text(m.text), 1 if has_sp else 0, 'gif', dt))
-                elif not m.media and m.text and clean_text(m.text):
+                elif m.grouped_id and (isinstance(m.media, MessageMediaPhoto) or isinstance(m.media, MessageMediaDocument)):
+                    got.append((uname, m.id, clean_text(m.text), 1 if has_sp else 0, 'album', dt))
+                elif not m.media and m.text and m.text.strip():
                     got.append((uname, m.id, clean_text(m.text), 1 if has_sp else 0, 'text', dt))
-                if len(got) >= 2: break
+                if len(got) >= 4: break
         except Exception as e:
             logger.error(f"fetch {uname}: {e}")
         pool.extend(got)
     if not pool:
         return await bot.send_message(chat_id, "⚠️ پستی پیدا نشد.", reply_markup=menu_kb())
-    pool.sort(key=lambda x: x[5], reverse=True)
-    top = pool[:random.randint(10,15)]
-    chosen = [list(t)[:5] for t in random.sample(top, min(5, len(top)))]
+    media_items=[t for t in pool if t[4]!='text']
+    text_items=[t for t in pool if t[4]=='text']
+    random.shuffle(media_items); random.shuffle(text_items)
+    # 1 text + 4 media
+    text_part=text_items[:1] if text_items else []
+    media_part=media_items[:4]
+    if len(media_part)<4:
+        media_part+=media_items[4:8]
+        media_part+=text_items[1:5-len(media_part)]
+    sel=text_part+media_part
+    random.shuffle(sel)
+    chosen=[list(t)[:5] for t in sel[:5]]
 
     async with aiosqlite.connect('auto_pub.db') as conn:
         cur = await conn.execute("INSERT INTO batches (admin_id, created_at) VALUES (?, ?)", (chat_id, datetime.now().isoformat()))
@@ -584,21 +604,40 @@ async def generate_batch(chat_id):
     for pid in ids:
         await send_preview(chat_id, pid)
 
+PREVIEW_MSGS=[]
+PREVIEW_PID={}
 async def send_preview(chat_id, pid):
     async with aiosqlite.connect('auto_pub.db') as conn:
         row = await (await conn.execute("SELECT source, msg_id, text, media, is_spoiler FROM batch_posts WHERE id=?", (pid,))).fetchone()
     if not row: return
     source, mid, text, media, is_spoiler = row
     kb = preview_kb(pid, is_spoiler)
+    def reg(m):
+        try:
+            lst = m if isinstance(m,(list,tuple)) else [m]
+            for x in lst:
+                PREVIEW_MSGS.append((chat_id,x.message_id)); PREVIEW_PID.setdefault(pid,[]).append(x.message_id)
+        except Exception: pass
     if media:
-        path = await get_media_path(source, mid)
+        paths = await get_album_paths(source, mid)
+        if len(paths) > 1:
+            from aiogram.types import InputMediaPhoto
+            ml=[]
+            for i,p in enumerate(paths):
+                ml.append(InputMediaPhoto(media=FSInputFile(p), has_spoiler=bool(is_spoiler), caption=(text or None if i==0 else None)))
+            _m=await bot.send_media_group(chat_id, ml)
+            reg(_m)
+            _c=await bot.send_message(chat_id, "🎞 آلبوم بالا — تایید/رد:", reply_markup=kb)
+            reg(_c)
+            return
+        path = paths[0] if paths else None
         if path:
             if path.endswith('.mp4'):
-                await bot.send_animation(chat_id, FSInputFile(path), caption=text or None, reply_markup=kb)
+                _m=await bot.send_animation(chat_id, FSInputFile(path), caption=text or None, reply_markup=kb); reg(_m)
             else:
-                await bot.send_photo(chat_id, FSInputFile(path), caption=text or None, reply_markup=kb)
+                _m=await bot.send_photo(chat_id, FSInputFile(path), caption=text or None, reply_markup=kb); reg(_m)
             return
-    await bot.send_message(chat_id, text or "(بدون متن)", reply_markup=kb)
+    _m=await bot.send_message(chat_id, text or "(بدون متن)", reply_markup=kb); reg(_m)
 
 async def after_review(chat_id, batch_id):
     async with aiosqlite.connect('auto_pub.db') as conn:
@@ -615,6 +654,9 @@ async def cb_approve(callback: types.CallbackQuery):
         await conn.commit()
     try: await callback.message.delete()
     except Exception: pass
+    for _mid in PREVIEW_PID.pop(pid,[]):
+        try: await bot.delete_message(callback.from_user.id, _mid)
+        except Exception: pass
     await after_review(callback.from_user.id, row[0])
     await callback.answer()
 
@@ -627,6 +669,9 @@ async def cb_reject(callback: types.CallbackQuery):
         await conn.commit()
     try: await callback.message.delete()
     except Exception: pass
+    for _mid in PREVIEW_PID.pop(pid,[]):
+        try: await bot.delete_message(callback.from_user.id, _mid)
+        except Exception: pass
     await after_review(callback.from_user.id, row[0])
     await callback.answer()
 
@@ -882,8 +927,37 @@ async def do_publish(pid):
             caption = build_caption(body)
             guard += 1
         path = None
+        paths = []
         if media:
-            path = await get_media_path(source, mid)
+            paths = await get_album_paths(source, mid)
+            path = paths[0] if paths else None
+        if media and len(paths) > 1:
+            ok=False; sent_via='none'
+            if not is_spoiler and '<tg-emoji' in caption and os.path.exists('premium_session.session'):
+                try:
+                    if not premium_client.is_connected(): await premium_client.connect()
+                    await premium_client.send_file(channel, paths, caption=caption, parse_mode='html')
+                    ok=True; sent_via='album-prem'
+                except Exception as e1: PUBLISH_ERR=str(e1)
+            if not ok:
+                from aiogram.types import InputMediaVideo, InputMediaPhoto
+                try:
+                    ml=[]
+                    for i,p in enumerate(paths):
+                        cap=strip_prem(caption) if i==0 else None
+                        if p.endswith('.mp4'):
+                            ml.append(InputMediaVideo(media=FSInputFile(p), has_spoiler=bool(is_spoiler), caption=cap, parse_mode=(ParseMode.HTML if i==0 else None)))
+                        else:
+                            ml.append(InputMediaPhoto(media=FSInputFile(p), has_spoiler=bool(is_spoiler), caption=cap, parse_mode=(ParseMode.HTML if i==0 else None)))
+                    await bot.send_media_group(channel, ml)
+                    ok=True; sent_via='bot-album'
+                except Exception as e1: PUBLISH_ERR=str(e1)
+            DBG_LIST.append(f"#{pid} album via={sent_via}")
+            async with aiosqlite.connect('auto_pub.db') as conn:
+                await conn.execute("UPDATE batch_posts SET status='published' WHERE id=?", (pid,))
+                await conn.execute("INSERT OR IGNORE INTO published (source, msg_id, published_at) VALUES (?,?,?)", (source, mid, datetime.now().isoformat()))
+                await conn.commit()
+            return ok
         sent = False
         sent_via = 'none'
         prem_exists = os.path.exists('premium_session.session')
